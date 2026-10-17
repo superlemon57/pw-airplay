@@ -104,6 +104,46 @@ Sounds that are not tied to a picture (notifications, games) are heard about
   network traffic (for instance Mullvad with "Local network sharing" off)
   prevent any connection.
 
+## Security
+
+- The engine's HTTP server listens on the network, because speakers report
+  volume changes and play/pause through DACP requests to it. Everything else
+  on it is refused to other hosts: the JSON API is only trusted from
+  localhost, the web interface likewise, and the DAAP library share is locked
+  with a random password.
+- DACP requests are accepted from a speaker we stream to, identified by its
+  Active-Remote id. That id derives from the speaker's device id, which is
+  public in its mDNS records, so a host on the local network can send
+  play/pause/next/previous and volume commands while a session is active.
+  This is how AirPlay senders work in general (iTunes, OwnTone); the impact
+  is limited to controlling playback.
+- Only the DACP service is advertised over mDNS. OwnTone's library, web and
+  remote control adverts are disabled.
+- Pipes and state are private to the user (mode 0700/0600); the generated
+  engine configuration, which holds the library password, is 0600.
+
+`tests/check_exposure.sh` checks these points on a running installation.
+
+## Tests
+
+```sh
+python3 -I tests/run.py          # end to end, needs a running PipeWire session
+tests/check_exposure.sh          # network and file exposure of an installation
+```
+
+`tests/run.py` builds pw-airplayd with AddressSanitizer and
+UndefinedBehaviorSanitizer and runs it against a mock of the engine and a
+mock MPRIS player, playing a test tone to test sinks only (no speaker is
+involved). It covers sink creation, reported latency, pacing of the audio
+feed, volume in both directions, now playing metadata and artwork, remote
+commands, pause and resume, switching outputs, idle release, malformed
+input, the engine going away, descriptor and memory stability over repeated
+play/release cycles, and sanitizer reports. Requirements: `pw-play`,
+`wpctl`, `pw-dump`, PyGObject.
+
+The engine patch is not covered: its live-pipe, MediaRemote and DACP changes
+were tested against HomePod mini hardware only.
+
 ## Troubleshooting
 
 ```sh

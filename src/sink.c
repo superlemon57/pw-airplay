@@ -387,6 +387,11 @@ struct sink *sink_new(struct pw_core *core, struct pw_loop *data_loop, struct en
 		/* Never grab the default output on our own, like other network sinks */
 		PW_KEY_PRIORITY_SESSION, "100",
 		"device.api", "airplay",
+		/* The volume is the speaker's own, which we mirror. WirePlumber
+		 * would otherwise restore the last one it saw for this name over
+		 * it, and push that to the speaker. */
+		"state.restore-props", "false",
+		"state.restore-target", "false",
 		"pw-airplay.target", key,
 		NULL);
 	free(node_name);

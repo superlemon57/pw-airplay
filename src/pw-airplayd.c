@@ -44,6 +44,13 @@
 /* Speakers dropping out before this are a failed start, not a takeover */
 #define TAKEOVER_MIN_NS (15 * SPA_NSEC_PER_SEC)
 #define RETRY_DELAY_NS (10 * SPA_NSEC_PER_SEC)
+#define MDNS_WAIT_NS (3 * SPA_NSEC_PER_SEC)
+
+struct seen_output {
+	char *id;
+	uint64_t since;
+	struct seen_output *next;
+};
 
 struct dsink {
 	struct sink *sink;
@@ -73,6 +80,8 @@ struct daemon {
 	struct ot_output *outputs;
 	int n_outputs;
 	bool api_up;
+	/* When each output id was first seen, see build_units() */
+	struct seen_output *seen;
 
 	/* The sink currently playing on the speakers */
 	struct sink *owner;
@@ -102,6 +111,21 @@ static uint32_t total_latency_ms(struct daemon *d)
 	int ms = d->cfg.start_buffer_ms + d->cfg.pipe_start_buffer_ms +
 		 (int)engine_target_level_ms() + 10 + d->cfg.latency_offset_ms;
 	return ms > 0 ? (uint32_t)ms : 0;
+}
+
+static uint64_t output_first_seen(struct daemon *d, const char *id)
+{
+	struct seen_output *s;
+
+	for (s = d->seen; s; s = s->next)
+		if (strcmp(s->id, id) == 0)
+			return s->since;
+	s = xcalloc(1, sizeof(*s));
+	s->id = xstrdup(id);
+	s->since = now_ns();
+	s->next = d->seen;
+	d->seen = s;
+	return s->since;
 }
 
 static struct ot_output *find_output(struct daemon *d, const char *id)
@@ -254,10 +278,15 @@ static int build_units(struct daemon *d, struct unit **units, int *output_unit)
 		if (strncmp(o->type, "AirPlay", 7) != 0)
 			continue;
 
-		/* Wait until we know whether it's part of a pair, otherwise both
-		 * halves would briefly show up as separate speakers */
-		if (!mdns_lookup(d->mdns, o->name, &info) && d->mdns)
-			continue;
+		/* Wait a little to know whether it's part of a pair, otherwise
+		 * both halves would briefly show up as separate speakers. If
+		 * mDNS never tells, it's taken as a speaker on its own. */
+		if (!mdns_lookup(d->mdns, o->name, &info) && d->mdns) {
+			uint64_t since = output_first_seen(d, o->id);
+
+			if (elapsed_ns(now_ns(), since) < MDNS_WAIT_NS)
+				continue;
+		}
 		description = info.group ? info.group : o->name;
 		if (config_is_hidden(&d->cfg, o->name) || config_is_hidden(&d->cfg, description)) {
 			mdns_info_clear(&info);
@@ -450,7 +479,7 @@ static void reconcile_sinks(struct daemon *d)
 			continue;
 		if (ds->missing_since == 0)
 			ds->missing_since = now;
-		else if (now - ds->missing_since > MISSING_GRACE_NS)
+		else if (elapsed_ns(now, ds->missing_since) > MISSING_GRACE_NS)
 			destroy_dsink(d, ds);
 	}
 
@@ -502,7 +531,7 @@ static void on_poll(void *data, uint64_t expirations)
 		 * for a while it can only be the latter, and like macOS we let it
 		 * have them. */
 		if (d->owner_confirmed && !any_selected) {
-			if (d->selected_since && now_ns() - d->selected_since > TAKEOVER_MIN_NS) {
+			if (d->selected_since && elapsed_ns(now_ns(), d->selected_since) > TAKEOVER_MIN_NS) {
 				pw_log_info("speakers taken over by another AirPlay sender");
 				release_speakers(d, "taken over");
 				d->evicted = true;
@@ -538,7 +567,7 @@ static void on_supervise(void *data, uint64_t expirations)
 			playing = ds->sink;
 		}
 	}
-	if (playing && now - newest > RECENT_AUDIO_NS)
+	if (playing && elapsed_ns(now, newest) > RECENT_AUDIO_NS)
 		playing = NULL;
 
 	engine_get_stats(d->engine, &stats);
@@ -559,17 +588,17 @@ static void on_supervise(void *data, uint64_t expirations)
 		if (d->np && nowplaying_tick(d->np, now))
 			idle_ns = (uint64_t)d->cfg.pause_timeout_s * SPA_NSEC_PER_SEC;
 
-		if (now - last > idle_ns) {
+		if (elapsed_ns(now, last) > idle_ns) {
 			release_speakers(d, "idle");
 			return;
 		}
 		/* Switching outputs: another sink plays while ours is quiet */
-		if (playing && playing != d->owner && now - last > RECENT_AUDIO_NS) {
+		if (playing && playing != d->owner && elapsed_ns(now, last) > RECENT_AUDIO_NS) {
 			claim_speakers(d, playing);
 			return;
 		}
 		/* OwnTone never started playing, e.g. speaker unreachable */
-		if (!d->owner_confirmed && now - d->owner_started > START_TIMEOUT_NS) {
+		if (!d->owner_confirmed && elapsed_ns(now, d->owner_started) > START_TIMEOUT_NS) {
 			struct sink *s = d->owner;
 
 			pw_log_warn("'%s' did not start, retrying", sink_description(s));
@@ -645,11 +674,16 @@ static int prepare_data_dir(const struct config *cfg)
 		snprintf(path, sizeof(path), "%s%s", cfg->data_dir, subdirs[i]);
 		if (mkdir(path, 0700) < 0 && errno != EEXIST)
 			return -errno;
+		/* Only the engine and us may touch the pipes */
+		if (chmod(path, 0700) < 0)
+			return -errno;
 	}
 	for (size_t i = 0; i < SPA_N_ELEMENTS(fifos); i++) {
 		if (stat(fifos[i], &st) == 0 && !S_ISFIFO(st.st_mode))
 			return -EEXIST;
 		if (mkfifo(fifos[i], 0600) < 0 && errno != EEXIST)
+			return -errno;
+		if (chmod(fifos[i], 0600) < 0)
 			return -errno;
 	}
 	return 0;
@@ -705,24 +739,30 @@ int main(int argc, char *argv[])
 
 	if ((res = config_load(&d.cfg, config_path)) < 0) {
 		fprintf(stderr, "can't read %s: %s\n", config_path, strerror(-res));
+		free(config_path);
+		config_free(&d.cfg);
 		return 1;
 	}
 	free(config_path);
 
-	if (engine_conf) {
-		if ((res = prepare_data_dir(&d.cfg)) < 0) {
-			fprintf(stderr, "can't prepare %s: %s\n", d.cfg.data_dir, strerror(-res));
-			return 1;
-		}
-		if ((res = config_write_owntone_conf(&d.cfg, engine_conf)) < 0) {
-			fprintf(stderr, "can't write %s: %s\n", engine_conf, strerror(-res));
-			return 1;
-		}
-		return 0;
-	}
 	if (print_latency) {
 		printf("%u\n", total_latency_ms(&d));
+		config_free(&d.cfg);
 		return 0;
+	}
+
+	/* Done by the engine's service through --write-engine-conf, and again
+	 * here since we may start first */
+	if ((res = prepare_data_dir(&d.cfg)) < 0) {
+		fprintf(stderr, "can't prepare %s: %s\n", d.cfg.data_dir, strerror(-res));
+		config_free(&d.cfg);
+		return 1;
+	}
+	if (engine_conf) {
+		if ((res = config_write_owntone_conf(&d.cfg, engine_conf)) < 0)
+			fprintf(stderr, "can't write %s: %s\n", engine_conf, strerror(-res));
+		config_free(&d.cfg);
+		return res < 0 ? 1 : 0;
 	}
 
 	signal(SIGPIPE, SIG_IGN);
@@ -776,6 +816,13 @@ int main(int argc, char *argv[])
 	pw_loop_destroy_source(d.loop, d.supervise_timer);
 	engine_free(d.engine);
 	ot_free_outputs(d.outputs, d.n_outputs);
+	while (d.seen) {
+		struct seen_output *s = d.seen;
+
+		d.seen = s->next;
+		free(s->id);
+		free(s);
+	}
 	ot_client_free(d.ot);
 	mdns_free(d.mdns);
 	nowplaying_free(d.np);

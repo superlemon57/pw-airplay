@@ -28,6 +28,8 @@ An AirPlay 2 output for PipeWire. Two programs cooperate:
 | `engine/owntone-29.3.patch` | changes to OwnTone, with a header describing them |
 | `systemd/` | user units (daemon, engine) and the `airptpd` system unit |
 | `install.sh`, `install-system.sh`, `uninstall.sh` | installation |
+| `tests/run.py` | end to end tests against `mock_engine.py` and `mock_player.py`, under sanitizers |
+| `tests/check_exposure.sh` | network and file exposure checks of a running installation |
 
 ## Building
 
@@ -36,8 +38,13 @@ make            # needs pipewire, libcurl, json-c, avahi-client, libsystemd deve
 make install    # to ~/.local/bin
 ```
 
-There is no test suite. Before submitting, the build must be free of
-warnings, and the GCC analyzer clean:
+Before submitting, run the tests (see README, "Tests"); they must all pass:
+
+```sh
+python3 -I tests/run.py
+```
+
+The build must be free of warnings, and the GCC analyzer clean:
 
 ```sh
 for f in src/*.c; do
@@ -100,6 +107,12 @@ to a pristine tree (`git apply --check`). Patch code follows OwnTone's style
 - OwnTone only opens the metadata pipe while it plays our audio pipe; data
   written before that is lost. `nowplaying.c` resends everything when it
   manages to open it.
+- Timestamps written by the data thread (e.g. `sink_last_audio_ns()`) can be
+  newer than a "now" taken earlier on the main thread. Compare times with
+  `elapsed_ns()`, never `now - then` on unsigned values.
+- Our sinks are `pw_stream`s, which WirePlumber would treat as streams and
+  restore volumes on; `state.restore-props = false` keeps the speaker's own
+  volume authoritative.
 
 ## Testing with real speakers
 

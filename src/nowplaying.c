@@ -719,6 +719,10 @@ static void update(struct nowplaying *np)
 		return;
 
 	p = select_player(np);
+	/* Players may close their stream while paused, keep following the one
+	 * we had until another one plays to the sink */
+	if (!p)
+		p = mpris_find(np->mpris, np->player);
 	if (!p) {
 		if (np->player)
 			pw_log_info("now playing: no media player found for this output");
@@ -932,7 +936,7 @@ bool nowplaying_tick(struct nowplaying *np, uint64_t now)
 		return false;
 
 	/* Until OwnTone has opened the metadata pipe, keep knocking */
-	if (!atomic_load(&np->connected) && now - np->last_probe > 500 * SPA_NSEC_PER_MSEC) {
+	if (!atomic_load(&np->connected) && elapsed_ns(now, np->last_probe) > 500 * SPA_NSEC_PER_MSEC) {
 		np->last_probe = now;
 		queue_simple(np, JOB_OPEN);
 	}
@@ -951,13 +955,13 @@ bool nowplaying_tick(struct nowplaying *np, uint64_t now)
 	app_paused = p && p->status && strcmp(p->status, "Playing") != 0;
 	last_audio = sink_last_audio_ns(np->owner);
 
-	if (!np->ot_paused && app_paused && now - last_audio > PAUSE_DELAY_NS) {
+	if (!np->ot_paused && app_paused && elapsed_ns(now, last_audio) > PAUSE_DELAY_NS) {
 		if (ot_player_pause(np->ot) == 0) {
 			pw_log_info("application paused, pausing AirPlay");
 			np->ot_paused = true;
 			np->paused_since = now;
 		}
-	} else if (np->ot_paused && (now - last_audio < RECENT_AUDIO_NS || !app_paused)) {
+	} else if (np->ot_paused && (elapsed_ns(now, last_audio) < RECENT_AUDIO_NS || !app_paused)) {
 		if (ot_player_play(np->ot) == 0) {
 			pw_log_info("resuming AirPlay");
 			np->ot_paused = false;
