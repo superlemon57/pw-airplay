@@ -1,0 +1,15 @@
+[Unit]
+Description=AirPlay 2 engine for pw-airplay (OwnTone)
+Documentation=file://@PREFIX@/share/doc/pw-airplay/README.md
+After=network-online.target avahi-daemon.service
+PartOf=pw-airplay.service
+
+[Service]
+Type=simple
+ExecStartPre=@PREFIX@/bin/pw-airplayd --write-engine-conf %h/.local/share/pw-airplay/owntone.conf
+ExecStart=@ENGINE@ -f -c %h/.local/share/pw-airplay/owntone.conf
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

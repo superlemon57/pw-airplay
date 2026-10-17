@@ -1,0 +1,17 @@
+[Unit]
+Description=AirPlay 2 output for PipeWire
+Documentation=file://@PREFIX@/share/doc/pw-airplay/README.md
+Requires=pw-airplay-engine.service
+After=pipewire.service pipewire-pulse.service wireplumber.service pw-airplay-engine.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+# Our messages at info level, PipeWire library ones at warning
+Environment=PIPEWIRE_DEBUG=2,default:3
+ExecStart=@PREFIX@/bin/pw-airplayd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

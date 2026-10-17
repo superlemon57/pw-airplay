@@ -1,0 +1,1178 @@
+pw-airplay changes to OwnTone 29.3 (owntone/owntone-server tag 29.3)
+
+OwnTone is used as the AirPlay 2 sending engine, fed with live audio through
+a named pipe. These changes adapt it to that use:
+
+- Live pipe start (input.c, player.c, pipe_start_buffer_ms): playback of a
+  pipe starts once this much audio is buffered instead of ~2 s, and buffered
+  audio beyond it is dropped when the player clock starts, so the time spent
+  connecting to the speakers does not end up as permanent extra latency.
+  End to end latency is then the same in every session.
+- Remote commands (input.c, httpd_dacp.c, airplay_events.c,
+  pipe_remote_fifo): while a pipe plays, play/pause/next/previous from the
+  speakers are written to a fifo for the application feeding the pipe,
+  instead of acting on OwnTone's own queue. The AirPlay event parser also
+  understands "plps" and the numeric modernMediaRemoteCommand form.
+- MediaRemote (outputs/airplay.c): Apple receivers announcing bplist now
+  playing support get registered as a MediaRemote now playing source with
+  POST /command requests, the shape a real iPhone sends (as documented by the
+  cliairplay project). This makes HomePods report title and play state.
+- Network exposure (main.c, misc.c, httpd*.c, mdns_publish,
+  http_bind_address): no advertising as an iTunes/DAAP library, only the DACP
+  service the speakers need. DACP requests from a speaker we stream to are
+  authorized by its Active-Remote id rather than by network trust.
+- Build (configure.ac): the librespot-c subproject is not configured, so
+  building without Spotify support does not require protobuf-c.
+
+Apply with: git apply owntone-29.3.patch
+
+diff --git a/configure.ac b/configure.ac
+index 4dcd643..89ed6d4 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -408,7 +408,6 @@ dnl --- End options ---
+ dnl Unconditional since we always want to produce Makefiles for dist targets
+ AC_CONFIG_SUBDIRS([
+ 	src/libairptp
+-	src/inputs/librespot-c
+ ])
+ 
+ AC_CONFIG_FILES([
+diff --git a/src/conffile.c b/src/conffile.c
+index f197616..c5a691f 100644
+--- a/src/conffile.c
++++ b/src/conffile.c
+@@ -56,6 +56,8 @@ static cfg_opt_t sec_general[] =
+     CFG_STR_LIST("trusted_networks", "{lan}", CFGF_NONE),
+     CFG_BOOL("ipv6", cfg_false, CFGF_NONE),
+     CFG_STR("bind_address", NULL, CFGF_NONE),
++    CFG_STR("http_bind_address", NULL, CFGF_NONE),
++    CFG_BOOL("mdns_publish", cfg_true, CFGF_NONE),
+     CFG_STR("cache_dir", STATEDIR "/cache/" PACKAGE, CFGF_NONE),
+     CFG_STR("cache_path", NULL, CFGF_DEPRECATED),
+     CFG_INT("cache_daap_threshold", 1000, CFGF_NONE),
+@@ -122,6 +124,8 @@ static cfg_opt_t sec_library[] =
+     CFG_BOOL("pipe_autostart", cfg_true, CFGF_NONE),
+     CFG_INT("pipe_sample_rate", 44100, CFGF_NONE),
+     CFG_INT("pipe_bits_per_sample", 16, CFGF_NONE),
++    CFG_INT("pipe_start_buffer_ms", 0, CFGF_NONE),
++    CFG_STR("pipe_remote_fifo", NULL, CFGF_NONE),
+     CFG_BOOL("rating_updates", cfg_false, CFGF_NONE),
+     CFG_BOOL("read_rating", cfg_false, CFGF_NONE),
+     CFG_BOOL("write_rating", cfg_false, CFGF_NONE),
+@@ -171,6 +175,8 @@ static cfg_opt_t sec_airplay_shared[] =
+     CFG_INT("control_port", 0, CFGF_NONE),
+     CFG_INT("timing_port", 0, CFGF_NONE),
+     CFG_BOOL("uncompressed_alac", cfg_false, CFGF_NONE),
++    // Identity for MediaRemote now playing, Apple receivers want an app they know
++    CFG_STR("mediaremote_bundle_id", "com.apple.Music", CFGF_NONE),
+     CFG_END()
+   };
+ 
+diff --git a/src/httpd.c b/src/httpd.c
+index e33cbae..e7bc047 100644
+--- a/src/httpd.c
++++ b/src/httpd.c
+@@ -1489,7 +1489,7 @@ bind_test(unsigned short port)
+   struct net_socket socket = NET_SOCKET_INIT;
+   int ret;
+ 
+-  ret = net_bind(&socket, &port, SOCK_STREAM, "httpd init");
++  ret = net_bind_http(&socket, &port, SOCK_STREAM, "httpd init", false);
+   if (ret < 0)
+     return -1;
+ 
+diff --git a/src/httpd_dacp.c b/src/httpd_dacp.c
+index 5150bee..468661f 100644
+--- a/src/httpd_dacp.c
++++ b/src/httpd_dacp.c
+@@ -43,6 +43,7 @@
+ #include "library.h"
+ #include "db.h"
+ #include "player.h"
++#include "input.h"
+ #include "listener.h"
+ 
+ #define DACP_VOLUME_STEP 5
+@@ -596,6 +597,7 @@ seek_timer_cb(int fd, short what, void *arg)
+ static int
+ dacp_request_authorize(struct httpd_request *hreq)
+ {
++  struct player_speaker_info speaker_info;
+   const char *param;
+   uint32_t id;
+   int ret;
+@@ -603,6 +605,12 @@ dacp_request_authorize(struct httpd_request *hreq)
+   if (httpd_request_is_trusted(hreq))
+     return 0;
+ 
++  // An AirPlay speaker we are streaming to, identified by the Active-Remote we
++  // gave it, may control us without being in trusted_networks
++  param = httpd_header_find(hreq->in_headers, "Active-Remote");
++  if (param && safe_atou32(param, &id) == 0 && player_speaker_get_byactiveremote(&speaker_info, id) == 0)
++    return 0;
++
+   param = httpd_query_value_find(hreq->query, "session-id");
+   if (!param)
+     {
+@@ -1344,6 +1352,17 @@ dacp_reply_cue(struct httpd_request *hreq)
+     }
+ }
+ 
++// Commands for a live pipe source go to the application feeding it
++static bool
++dacp_forward(struct httpd_request *hreq, const char *command)
++{
++  if (!input_live_remote_forward(command))
++    return false;
++
++  httpd_send_reply(hreq, HTTP_NOCONTENT, "No Content", HTTPD_SEND_NO_GZIP);
++  return true;
++}
++
+ static int
+ dacp_reply_play(struct httpd_request *hreq)
+ {
+@@ -1353,6 +1372,9 @@ dacp_reply_play(struct httpd_request *hreq)
+   if (ret < 0)
+     return -1;
+ 
++  if (dacp_forward(hreq, "play"))
++    return 0;
++
+   ret = player_playback_start();
+   if (ret < 0)
+     {
+@@ -1511,6 +1533,9 @@ dacp_reply_stop(struct httpd_request *hreq)
+   if (ret < 0)
+     return -1;
+ 
++  if (dacp_forward(hreq, "stop"))
++    return 0;
++
+   player_playback_stop();
+ 
+   /* 204 No Content is the canonical reply */
+@@ -1528,6 +1553,9 @@ dacp_reply_pause(struct httpd_request *hreq)
+   if (ret < 0)
+     return -1;
+ 
++  if (dacp_forward(hreq, "pause"))
++    return 0;
++
+   player_playback_pause();
+ 
+   /* 204 No Content is the canonical reply */
+@@ -1546,6 +1574,9 @@ dacp_reply_playpause(struct httpd_request *hreq)
+   if (ret < 0)
+     return -1;
+ 
++  if (dacp_forward(hreq, "playpause"))
++    return 0;
++
+   player_get_status(&status);
+   if (status.status == PLAY_PLAYING)
+     {
+@@ -1578,6 +1609,9 @@ dacp_reply_nextitem(struct httpd_request *hreq)
+   if (ret < 0)
+     return -1;
+ 
++  if (dacp_forward(hreq, "next"))
++    return 0;
++
+   ret = player_playback_next();
+   if (ret < 0)
+     {
+@@ -1611,6 +1645,9 @@ dacp_reply_previtem(struct httpd_request *hreq)
+   if (ret < 0)
+     return -1;
+ 
++  if (dacp_forward(hreq, "prev"))
++    return 0;
++
+   ret = player_playback_prev();
+   if (ret < 0)
+     {
+@@ -1678,6 +1715,9 @@ dacp_reply_playresume(struct httpd_request *hreq)
+   if (ret < 0)
+     return -1;
+ 
++  if (dacp_forward(hreq, "play"))
++    return 0;
++
+   /* TODO */
+ 
+   /* 204 No Content is the canonical reply */
+diff --git a/src/httpd_libevhttp.c b/src/httpd_libevhttp.c
+index a88eb6e..f5f62f2 100644
+--- a/src/httpd_libevhttp.c
++++ b/src/httpd_libevhttp.c
+@@ -662,7 +662,7 @@ httpd_server_new(struct event_base *evbase, unsigned short port, httpd_request_c
+   server->socket.fd4 = -1;
+   server->socket.fd6 = -1;
+ 
+-  ret = net_bind_with_reuseport(&server->socket, &port, SOCK_STREAM, "httpd");
++  ret = net_bind_http(&server->socket, &port, SOCK_STREAM, "httpd", true);
+   if (ret < 0)
+     goto error;
+ 
+diff --git a/src/input.c b/src/input.c
+index cf0fee0..21ad100 100644
+--- a/src/input.c
++++ b/src/input.c
+@@ -21,6 +21,7 @@
+ #endif
+ 
+ #include <stdio.h>
++#include <fcntl.h>
+ #include <stdlib.h>
+ #include <stdbool.h>
+ #include <unistd.h>
+@@ -142,6 +143,13 @@ static struct input_buffer input_buffer;
+ // Timeout waiting in playback loop
+ static struct timespec input_loop_timeout = { 0, INPUT_LOOP_TIMEOUT_NSEC };
+ 
++// For live pipe sources (e.g. a sound server sink feeding us in real time) we
++// don't want to wait for the whole INPUT_BUFFER_THRESHOLD before starting
++// playback, since that adds the same amount to the end-to-end latency. If set
++// via the pipe_start_buffer_ms option, playback starts as soon as this many
++// bytes have been buffered.
++static size_t pipe_start_buffer_bytes;
++
+ // Timeout waiting for player read
+ static struct timeval input_open_timeout = { INPUT_OPEN_TIMEOUT, 0 };
+ static struct event *input_open_timeout_ev;
+@@ -657,6 +665,8 @@ input_write(struct evbuffer *evbuf, struct media_quality *quality, short flags)
+ 	  input_stop();
+ 	  flags |= INPUT_FLAG_ERROR;
+ 	}
++      else if (pipe_start_buffer_bytes && input_now_reading.type == INPUT_TYPE_PIPE && evbuffer_get_length(input_buffer.evbuf) >= pipe_start_buffer_bytes)
++	buffer_full_cb();
+     }
+ 
+   if (flags)
+@@ -846,6 +856,80 @@ input_read(void *data, size_t size, short *flag, void **flagdata)
+   return len;
+ }
+ 
++// For live pipe sources: discards buffered data beyond pipe_start_buffer_ms,
++// so that the delay accumulated while outputs were starting up doesn't end up
++// as permanent extra latency. Must be called before the player starts reading.
++void
++input_live_trim(void)
++{
++  struct marker *marker;
++  size_t len;
++  size_t n;
++
++  pthread_mutex_lock(&input_buffer.mutex);
++
++  len = evbuffer_get_length(input_buffer.evbuf);
++  if (!pipe_start_buffer_bytes || input_now_reading.type != INPUT_TYPE_PIPE || len <= pipe_start_buffer_bytes)
++    goto out;
++
++  n = len - pipe_start_buffer_bytes;
++  n -= n % 4; // Keep frame alignment (pipe input is always 16 bit stereo)
++
++  evbuffer_drain(input_buffer.evbuf, n);
++  input_buffer.bytes_read += n;
++
++  // Markers in the discarded range (e.g. the initial quality marker) must still
++  // reach the player, so move them up to the new read position
++  for (marker = input_buffer.marker_tail; marker && marker->pos < input_buffer.bytes_read; marker = marker->prev)
++    marker->pos = input_buffer.bytes_read;
++
++  DPRINTF(E_INFO, L_PLAYER, "Live pipe: trimmed %zu bytes of start-up backlog\n", n);
++
++ out:
++  pthread_mutex_unlock(&input_buffer.mutex);
++}
++
++// While a live pipe source plays, remote commands from speakers (play/pause,
++// next, previous) are meant for whatever feeds the pipe, not for our own
++// player: "next" would end the pipe item. If pipe_remote_fifo is configured,
++// they are written there as lines ("play", "pause", "playpause", "next",
++// "prev", "stop") for the feeding application. Returns true if forwarded, so
++// the caller must not act on the command itself. Any thread.
++bool
++input_live_remote_forward(const char *command)
++{
++  const char *path = cfg_getstr(cfg_getsec(cfg, "library"), "pipe_remote_fifo");
++  char line[32];
++  bool live;
++  int len;
++  int fd;
++
++  if (!path)
++    return false;
++
++  pthread_mutex_lock(&input_buffer.mutex);
++  live = (input_now_reading.type == INPUT_TYPE_PIPE && input_now_reading.open);
++  pthread_mutex_unlock(&input_buffer.mutex);
++  if (!live)
++    return false;
++
++  // Fails with ENXIO if nobody is listening, then we handle it ourselves
++  fd = open(path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
++  if (fd < 0)
++    return false;
++
++  len = snprintf(line, sizeof(line), "%s\n", command);
++  if (write(fd, line, len) != len)
++    {
++      close(fd);
++      return false;
++    }
++  close(fd);
++
++  DPRINTF(E_INFO, L_PLAYER, "Live pipe: forwarded remote command '%s'\n", command);
++  return true;
++}
++
+ void
+ input_buffer_full_cb(input_cb cb)
+ {
+@@ -924,6 +1008,12 @@ input_init(void)
+   int ret;
+   int i;
+ 
++  pipe_start_buffer_bytes = (size_t)cfg_getint(cfg_getsec(cfg, "library"), "pipe_start_buffer_ms") *
++    cfg_getint(cfg_getsec(cfg, "library"), "pipe_sample_rate") / 1000 *
++    (cfg_getint(cfg_getsec(cfg, "library"), "pipe_bits_per_sample") / 8) * 2;
++  if (pipe_start_buffer_bytes > INPUT_BUFFER_THRESHOLD)
++    pipe_start_buffer_bytes = INPUT_BUFFER_THRESHOLD;
++
+   // Prepare input buffer
+   CHECK_ERR(L_PLAYER, mutex_init(&input_buffer.mutex));
+   CHECK_ERR(L_PLAYER, pthread_cond_init(&input_buffer.cond, NULL));
+diff --git a/src/input.h b/src/input.h
+index 4059eb9..6d4ccb6 100644
+--- a/src/input.h
++++ b/src/input.h
+@@ -187,6 +187,12 @@ input_read(void *data, size_t size, short *flag, void **flagdata);
+ void
+ input_buffer_full_cb(input_cb cb);
+ 
++void
++input_live_trim(void);
++
++bool
++input_live_remote_forward(const char *command);
++
+ /*
+  * Tells the input to start, i.e. after calling this function the input buffer
+  * will begin to fill up, and should be read periodically with input_read(). If
+diff --git a/src/main.c b/src/main.c
+index fd3c86a..a9a4a9a 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -239,6 +239,17 @@ register_services(char *ffid, bool no_web, bool no_rsp, bool no_daap, bool no_mp
+   uint32_t hash;
+   int i;
+   int ret;
++  bool publish = cfg_getbool(cfg_getsec(cfg, "general"), "mdns_publish");
++
++  // When not publishing we only keep the DACP service, which AirPlay speakers
++  // need to report volume changes and play/pause back to us
++  if (!publish)
++    {
++      no_web = true;
++      no_rsp = true;
++      no_daap = true;
++      no_mpd = true;
++    }
+ 
+   srand((unsigned int)time(NULL));
+ 
+@@ -327,6 +338,9 @@ register_services(char *ffid, bool no_web, bool no_rsp, bool no_daap, bool no_mp
+       txtrecord[i] = records[i];
+     }
+ 
++  if (!publish)
++    return 0;
++
+   // Register touch-able service, for Remote.app
+   snprintf(txtrecord[0], 128, "txtvers=1");
+   snprintf(txtrecord[1], 128, "DbId=%016" PRIX64, libhash);
+@@ -865,7 +879,7 @@ main(int argc, char **argv)
+     }
+ 
+   /* Register this CNAME with mDNS for OAuth */
+-  if (!mdns_no_cname)
++  if (!mdns_no_cname && cfg_getbool(cfg_getsec(cfg, "general"), "mdns_publish"))
+     {
+       mdns_cname("owntone.local");
+     }
+diff --git a/src/misc.c b/src/misc.c
+index 8b7ade8..f1cfd6c 100644
+--- a/src/misc.c
++++ b/src/misc.c
+@@ -667,9 +667,8 @@ bind_one(const char *node, unsigned short *port, int type, int family, const cha
+ }
+ 
+ static int
+-bind_impl(struct net_socket *socket, unsigned short *port, int type, const char *log_service_name, bool reuseport)
++bind_impl(struct net_socket *socket, unsigned short *port, int type, const char *log_service_name, bool reuseport, const char *bind_address)
+ {
+-  const char *bind_address = cfg_getstr(cfg_getsec(cfg, "general"), "bind_address");
+   bool v6_enabled = cfg_getbool(cfg_getsec(cfg, "general"), "ipv6");
+ 
+   // Normally comply with config, except for "::" where we want to listen on
+@@ -702,13 +701,27 @@ bind_impl(struct net_socket *socket, unsigned short *port, int type, const char
+ int
+ net_bind(struct net_socket *socket, unsigned short *port, int type, const char *log_service_name)
+ {
+-  return bind_impl(socket, port, type, log_service_name, false);
++  return bind_impl(socket, port, type, log_service_name, false, cfg_getstr(cfg_getsec(cfg, "general"), "bind_address"));
+ }
+ 
+ int
+ net_bind_with_reuseport(struct net_socket *socket, unsigned short *port, int type, const char *log_service_name)
+ {
+-  return bind_impl(socket, port, type, log_service_name, true);
++  return bind_impl(socket, port, type, log_service_name, true, cfg_getstr(cfg_getsec(cfg, "general"), "bind_address"));
++}
++
++// Like the above, but http_bind_address (if set) takes precedence, so that the
++// web/JSON API can be restricted to e.g. loopback while AirPlay uses all
++// interfaces
++int
++net_bind_http(struct net_socket *socket, unsigned short *port, int type, const char *log_service_name, bool reuseport)
++{
++  const char *bind_address = cfg_getstr(cfg_getsec(cfg, "general"), "http_bind_address");
++
++  if (!bind_address)
++    bind_address = cfg_getstr(cfg_getsec(cfg, "general"), "bind_address");
++
++  return bind_impl(socket, port, type, log_service_name, reuseport, bind_address);
+ }
+ 
+ int
+diff --git a/src/misc.h b/src/misc.h
+index 4347230..175d10e 100644
+--- a/src/misc.h
++++ b/src/misc.h
+@@ -64,6 +64,9 @@ net_bind(struct net_socket *socket, unsigned short *port, int type, const char *
+ int
+ net_bind_with_reuseport(struct net_socket *socket, unsigned short *port, int type, const char *log_service_name);
+ 
++int
++net_bind_http(struct net_socket *socket, unsigned short *port, int type, const char *log_service_name, bool reuseport);
++
+ // To avoid polluting namespace too much we don't include event2/http.h here
+ struct evhttp;
+ 
+diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
+index 9ba7410..a54a90d 100644
+--- a/src/outputs/airplay.c
++++ b/src/outputs/airplay.c
+@@ -172,6 +172,9 @@ enum airplay_seq_type
+   AIRPLAY_SEQ_PAIR_VERIFY,
+   AIRPLAY_SEQ_PAIR_TRANSIENT,
+   AIRPLAY_SEQ_FEEDBACK,
++  AIRPLAY_SEQ_MRP_REGISTER,
++  AIRPLAY_SEQ_MRP_NOWPLAYING,
++  AIRPLAY_SEQ_MRP_STATE,
+   AIRPLAY_SEQ_CONTINUE, // Must be last element
+ };
+ 
+@@ -203,6 +206,7 @@ struct airplay_extra
+   char *mdns_name;
+ 
+   uint16_t wanted_metadata;
++  bool wants_mediaremote;
+   bool supports_auth_setup;
+   bool supports_encryption;
+   bool use_ptp;
+@@ -252,6 +256,7 @@ struct airplay_session
+ 
+   uint64_t statusflags;
+   uint16_t wanted_metadata;
++  bool wants_mediaremote;
+   bool req_has_auth;
+   bool supports_auth_setup;
+   bool supports_encryption;
+@@ -317,6 +322,13 @@ struct airplay_metadata
+   struct evbuffer *metadata;
+   struct evbuffer *artwork;
+   int artwork_fmt;
++
++  // For MediaRemote
++  char *title;
++  char *artist;
++  char *album;
++  uint32_t len_ms;
++  uint64_t uid;
+ };
+ 
+ struct airplay_service
+@@ -1610,6 +1622,7 @@ session_make(struct output_device *device, int callback_id)
+ 
+   session->supports_auth_setup = extra->supports_auth_setup;
+   session->wanted_metadata = extra->wanted_metadata;
++  session->wants_mediaremote = extra->wants_mediaremote;
+   session->supports_encryption = extra->supports_encryption;
+ 
+   session->next_seq = AIRPLAY_SEQ_CONTINUE;
+@@ -1649,6 +1662,417 @@ session_make(struct output_device *device, int callback_id)
+ 
+ /* ----------------------------- Metadata handling -------------------------- */
+ 
++/* ---------------------------- MediaRemote --------------------------------
++ *
++ * Apple receivers (HomePod, Apple TV) only show what is playing, both on
++ * themselves and on an iPhone looking at them, and only offer remote control,
++ * for senders that register as a MediaRemote now playing source. The DMAP
++ * SET_PARAMETER metadata above is accepted but not displayed by them.
++ *
++ * A sender does this with POST /command requests on the encrypted RTSP
++ * connection, carrying binary plists. Shapes follow what a real iPhone sends,
++ * as captured and documented by the cliairplay project (Music Assistant,
++ * DESIGN.md section 8), with protobuf field numbers from pyatv. Receivers send
++ * commands back on the event channel, see airplay_events.c.
++ */
++
++#define MRP_MSG_DEVICE_INFO       15
++#define MRP_EXT_DEVICE_INFO       20
++#define MRP_DEVICE_CLASS_IPHONE   1
++#define MRP_LAST_SUPPORTED_MSG    139
++
++enum mrp_playback_state
++{
++  MRP_STATE_PLAYING = 1,
++  MRP_STATE_PAUSED  = 2,
++  MRP_STATE_STOPPED = 3,
++};
++
++// The receiver extrapolates elapsed time from the last value we sent, so we
++// keep a clock that is anchored on each update and frozen while paused
++static struct
++{
++  bool playing;
++  uint32_t base_ms;
++  struct timespec anchor; // CLOCK_REALTIME
++} mrp_clock;
++
++static void
++mrp_clock_set(uint32_t pos_ms, bool playing)
++{
++  mrp_clock.base_ms = pos_ms;
++  mrp_clock.playing = playing;
++  clock_gettime(CLOCK_REALTIME, &mrp_clock.anchor);
++}
++
++static double
++mrp_clock_elapsed(const struct timespec *now)
++{
++  double elapsed = mrp_clock.base_ms / 1000.0;
++
++  if (mrp_clock.playing)
++    elapsed += (now->tv_sec - mrp_clock.anchor.tv_sec) + (now->tv_nsec - mrp_clock.anchor.tv_nsec) / 1e9;
++  return elapsed > 0 ? elapsed : 0;
++}
++
++static void
++mrp_clock_pause(void)
++{
++  struct timespec now;
++
++  if (!mrp_clock.playing)
++    return;
++  clock_gettime(CLOCK_REALTIME, &now);
++  mrp_clock_set((uint32_t)(mrp_clock_elapsed(&now) * 1000), false);
++}
++
++static void
++mrp_clock_resume(void)
++{
++  if (mrp_clock.playing)
++    return;
++  mrp_clock_set(mrp_clock.base_ms, true);
++}
++
++// Stable per track, the receiver treats a new value as a new item
++static uint64_t
++mediaremote_uid(struct db_queue_item *queue_item)
++{
++  const char *parts[] = { queue_item->title, queue_item->artist, queue_item->album };
++  uint64_t hash = 14695981039346656037ULL; // FNV-1a
++  const char *p;
++
++  for (size_t i = 0; i < ARRAY_SIZE(parts); i++)
++    for (p = parts[i] ? parts[i] : ""; ; p++)
++      {
++	hash = (hash ^ (uint8_t)*p) * 1099511628211ULL;
++	if (!*p)
++	  break;
++      }
++  return hash & 0x7fffffffffffffffULL;
++}
++
++static const char *
++mediaremote_bundle_id(void)
++{
++  return cfg_getstr(cfg_getsec(cfg, "airplay_shared"), "mediaremote_bundle_id");
++}
++
++/* Minimal protobuf writer, enough for the few messages we send */
++
++static void
++pb_varint(struct evbuffer *b, uint64_t v)
++{
++  uint8_t buf[10];
++  int n = 0;
++
++  do
++    {
++      buf[n] = v & 0x7f;
++      v >>= 7;
++      if (v)
++	buf[n] |= 0x80;
++      n++;
++    }
++  while (v);
++  evbuffer_add(b, buf, n);
++}
++
++static void
++pb_uint(struct evbuffer *b, uint32_t field, uint64_t v)
++{
++  pb_varint(b, (uint64_t)field << 3);
++  pb_varint(b, v);
++}
++
++static void
++pb_bytes(struct evbuffer *b, uint32_t field, const void *data, size_t len)
++{
++  pb_varint(b, ((uint64_t)field << 3) | 2);
++  pb_varint(b, len);
++  evbuffer_add(b, data, len);
++}
++
++static void
++pb_string(struct evbuffer *b, uint32_t field, const char *s)
++{
++  pb_bytes(b, field, s, strlen(s));
++}
++
++static void
++pb_message(struct evbuffer *b, uint32_t field, struct evbuffer *sub)
++{
++  pb_bytes(b, field, evbuffer_pullup(sub, -1), evbuffer_get_length(sub));
++}
++
++static void
++mrp_device_uuid(char *out, size_t size)
++{
++  // Stable across restarts, derived from our identity
++  snprintf(out, size, "%08X-%04X-4%03X-8%03X-%012" PRIX64,
++	   (uint32_t)(libhash >> 32), (uint32_t)(libhash >> 16) & 0xffff, (uint32_t)libhash & 0xfff,
++	   (uint32_t)(airplay_device_id >> 48) & 0xfff, (uint64_t)(airplay_device_id & 0xffffffffffffULL));
++}
++
++static int
++mrp_plist_add(struct evrtsp_request *req, plist_t root)
++{
++  uint8_t *data;
++  size_t len;
++  int ret;
++
++  ret = wplist_to_bin(&data, &len, root);
++  plist_free(root);
++  if (ret < 0)
++    return -1;
++
++  evbuffer_add(req->output_buffer, data, len);
++  free(data);
++  return 0;
++}
++
++// { type: <type>, params: <params> }
++static int
++mrp_command_add(struct evrtsp_request *req, const char *type, plist_t params)
++{
++  plist_t root = plist_new_dict();
++
++  DPRINTF(E_INFO, L_AIRPLAY, "MediaRemote: sending %s\n", type ? type : "device info");
++
++  if (type)
++    wplist_dict_add_string(root, "type", type);
++  plist_dict_set_item(root, "params", params);
++  return mrp_plist_add(req, root);
++}
++
++static int
++payload_make_mrp_device_info(struct evrtsp_request *req, struct airplay_session *session, void *arg)
++{
++  struct evbuffer *inner;
++  struct evbuffer *msg;
++  struct evbuffer *blob;
++  plist_t params;
++  char uuid[40];
++  char buf[24];
++  int ret;
++
++  CHECK_NULL(L_AIRPLAY, inner = evbuffer_new());
++  CHECK_NULL(L_AIRPLAY, msg = evbuffer_new());
++  CHECK_NULL(L_AIRPLAY, blob = evbuffer_new());
++
++  mrp_device_uuid(uuid, sizeof(uuid));
++  snprintf(buf, sizeof(buf), "%016" PRIX64, libhash);
++
++  // DeviceInfoMessage, the identity of a real iPhone sender
++  pb_string(inner, 1, uuid);                    // uniqueIdentifier
++  pb_string(inner, 2, airplay_client_name);     // name
++  pb_string(inner, 3, "iPhone");                // localizedModelName
++  pb_string(inner, 4, "21F90");                 // systemBuildVersion
++  pb_string(inner, 5, mediaremote_bundle_id()); // applicationBundleIdentifier
++  pb_uint(inner, 7, 1);                         // protocolVersion
++  pb_uint(inner, 8, MRP_LAST_SUPPORTED_MSG);    // lastSupportedMessageType
++  pb_uint(inner, 9, 1);                         // supportsSystemPairing
++  pb_uint(inner, 10, 1);                        // allowsPairing
++  pb_string(inner, 12, mediaremote_bundle_id());// systemMediaApplication
++  pb_uint(inner, 13, 1);                        // supportsACL
++  pb_uint(inner, 14, 1);                        // supportsSharedQueue
++  pb_uint(inner, 15, 1);                        // supportsExtendedMotion
++  pb_uint(inner, 17, 2);                        // sharedQueueVersion
++  pb_string(inner, 19, buf);                    // deviceUID (our DACP-ID)
++  pb_uint(inner, 21, MRP_DEVICE_CLASS_IPHONE);  // deviceClass
++  pb_uint(inner, 22, 1);                        // logicalDeviceCount
++  pb_string(inner, 31, "com.apple.podcasts");   // systemPodcastApplication
++  pb_string(inner, 39, "iPhone17,1");           // modelID
++  pb_string(inner, 41, session->session_uuid);  // routingContextID
++  pb_string(inner, 42, session->group_uuid);    // airPlayGroupID
++  pb_string(inner, 43, "com.apple.iBooks");     // systemBooksApplication
++
++  // ProtocolMessage envelope: type first, then the extension, then an id
++  uuid_make(uuid);
++  pb_uint(msg, 1, MRP_MSG_DEVICE_INFO);
++  pb_message(msg, MRP_EXT_DEVICE_INFO, inner);
++  pb_string(msg, 85, uuid);
++
++  // { params: { data: <varint length + protobuf> } }
++  pb_varint(blob, evbuffer_get_length(msg));
++  evbuffer_add_buffer(blob, msg);
++
++  params = plist_new_dict();
++  wplist_dict_add_data(params, "data", evbuffer_pullup(blob, -1), evbuffer_get_length(blob));
++  ret = mrp_command_add(req, NULL, params);
++
++  evbuffer_free(inner);
++  evbuffer_free(msg);
++  evbuffer_free(blob);
++  return ret;
++}
++
++static int
++payload_make_mrp_now_playing(struct evrtsp_request *req, struct airplay_session *session, void *arg)
++{
++  struct airplay_metadata *rmd = airplay_cur_metadata ? airplay_cur_metadata->priv : NULL;
++  struct timespec now;
++  double elapsed;
++  plist_t info;
++  plist_t params;
++  char artwork_id[24];
++
++  info = plist_new_dict();
++
++  // An empty dict clears what the receiver shows
++  if (rmd)
++    {
++      clock_gettime(CLOCK_REALTIME, &now);
++      // The timestamp only has whole seconds, so the elapsed time is given as
++      // of that second
++      elapsed = mrp_clock_elapsed(&now) - (mrp_clock.playing ? now.tv_nsec / 1e9 : 0);
++
++      wplist_dict_add_string(info, "kMRMediaRemoteNowPlayingInfoTitle", rmd->title ? rmd->title : "");
++      wplist_dict_add_string(info, "kMRMediaRemoteNowPlayingInfoArtist", rmd->artist ? rmd->artist : "");
++      wplist_dict_add_string(info, "kMRMediaRemoteNowPlayingInfoAlbum", rmd->album ? rmd->album : "");
++      if (rmd->len_ms > 0)
++	plist_dict_set_item(info, "kMRMediaRemoteNowPlayingInfoDuration", plist_new_real(rmd->len_ms / 1000.0));
++      plist_dict_set_item(info, "kMRMediaRemoteNowPlayingInfoElapsedTime", plist_new_real(elapsed > 0 ? elapsed : 0));
++      plist_dict_set_item(info, "kMRMediaRemoteNowPlayingInfoPlaybackRate", plist_new_real(mrp_clock.playing ? 1.0 : 0.0));
++      plist_dict_set_item(info, "kMRMediaRemoteNowPlayingInfoDefaultPlaybackRate", plist_new_real(1.0));
++      plist_dict_set_item(info, "kMRMediaRemoteNowPlayingInfoTimestamp", plist_new_unix_date(now.tv_sec));
++      wplist_dict_add_string(info, "kMRMediaRemoteNowPlayingInfoMediaType", "MRMediaRemoteMediaTypeMusic");
++      wplist_dict_add_uint(info, "kMRMediaRemoteNowPlayingInfoUniqueIdentifier", rmd->uid);
++
++      // The info is replaced as a whole on every push, so artwork must
++      // always be included or it disappears
++      if (rmd->artwork && rmd->artwork_fmt == ART_FMT_JPEG && evbuffer_get_length(rmd->artwork) > 0)
++	{
++	  snprintf(artwork_id, sizeof(artwork_id), "%016" PRIx64, rmd->uid);
++	  wplist_dict_add_string(info, "kMRMediaRemoteNowPlayingInfoArtworkIdentifier", artwork_id);
++	  wplist_dict_add_string(info, "kMRMediaRemoteNowPlayingInfoArtworkMIMEType", "image/jpeg");
++	  wplist_dict_add_data(info, "kMRMediaRemoteNowPlayingInfoArtworkData",
++	    evbuffer_pullup(rmd->artwork, -1), evbuffer_get_length(rmd->artwork));
++	}
++    }
++
++  params = plist_new_dict();
++  wplist_dict_add_string(params, "type", "npi-text");
++  wplist_dict_add_string(params, "mergePolicy", "replace");
++  plist_dict_set_item(params, "params", info);
++
++  return mrp_command_add(req, "updateMRNowPlayingInfo", params);
++}
++
++// Each entry is itself a serialized plist
++static void
++mrp_command_info_add(plist_t array, int command, bool enabled, plist_t options)
++{
++  plist_t dict = plist_new_dict();
++  uint8_t *data;
++  size_t len;
++
++  wplist_dict_add_int(dict, "kCommandInfoCommandKey", command);
++  wplist_dict_add_bool(dict, "kCommandInfoEnabledKey", enabled);
++  if (options)
++    plist_dict_set_item(dict, "kCommandInfoOptionsKey", options);
++
++  if (wplist_to_bin(&data, &len, dict) == 0)
++    {
++      plist_array_append_item(array, plist_new_data((const char *)data, len));
++      free(data);
++    }
++  plist_free(dict);
++}
++
++static int
++payload_make_mrp_supported_commands(struct evrtsp_request *req, struct airplay_session *session, void *arg)
++{
++  // MRMediaRemoteCommand numbering, order as an iPhone sends it. We take
++  // play (0), pause (1), toggle (2), stop (3), next (4), previous (5), and
++  // leave seeking and skip intervals disabled.
++  static const int simple[] = { 10, 11, 8, 9, 5, 4, 3, 2, 1, 0 };
++  plist_t commands = plist_new_array();
++  plist_t params;
++  plist_t opt;
++
++  opt = plist_new_dict();
++  wplist_dict_add_int(opt, "kMRMediaRemoteCommandInfoShuffleMode", 1);
++  mrp_command_info_add(commands, 26, false, opt);
++
++  opt = plist_new_dict();
++  wplist_dict_add_int(opt, "kMRMediaRemoteCommandInfoRepeatMode", 1);
++  mrp_command_info_add(commands, 25, false, opt);
++
++  opt = plist_new_dict();
++  wplist_dict_add_bool(opt, "kMRMediaRemoteCommandInfoCanBeControlledByScrubbingKey", false);
++  wplist_dict_add_bool(opt, "kMRMediaRemoteCommandInfoSupportsReferencePosition", false);
++  mrp_command_info_add(commands, 24, false, opt);
++
++  for (size_t i = 0; i < ARRAY_SIZE(simple); i++)
++    mrp_command_info_add(commands, simple[i], simple[i] <= 5, NULL);
++
++  params = plist_new_dict();
++  plist_dict_set_item(params, "mrSupportedCommandsFromSender", commands);
++  return mrp_command_add(req, "updateMRSupportedCommands", params);
++}
++
++static int
++payload_make_mrp_playback_state(struct evrtsp_request *req, struct airplay_session *session, void *arg)
++{
++  plist_t params = plist_new_dict();
++
++  wplist_dict_add_uint(params, "mrPlaybackState", mrp_clock.playing ? MRP_STATE_PLAYING : MRP_STATE_PAUSED);
++  return mrp_command_add(req, "updateMRPlaybackState", params);
++}
++
++static int
++payload_make_mrp_now_playing_client(struct evrtsp_request *req, struct airplay_session *session, void *arg)
++{
++  struct evbuffer *client;
++  plist_t params;
++  int ret;
++
++  CHECK_NULL(L_AIRPLAY, client = evbuffer_new());
++
++  // NowPlayingClient protobuf, without envelope
++  pb_uint(client, 1, getpid());                  // processIdentifier
++  pb_string(client, 2, mediaremote_bundle_id()); // bundleIdentifier
++  pb_string(client, 7, airplay_client_name);     // displayName
++
++  params = plist_new_dict();
++  wplist_dict_add_data(params, "mrNowPlayingClient", evbuffer_pullup(client, -1), evbuffer_get_length(client));
++  ret = mrp_command_add(req, "updateMRNowPlayingClient", params);
++
++  evbuffer_free(client);
++  return ret;
++}
++
++static enum airplay_seq_type
++response_handler_mrp(struct evrtsp_request *req, struct airplay_session *session)
++{
++  if (req->response_code != RTSP_OK)
++    {
++      // Don't let now playing break audio, just stop trying
++      DPRINTF(E_LOG, L_AIRPLAY, "'%s' rejected MediaRemote now playing (%d %s), disabling it for this session\n",
++	session->devname, req->response_code, req->response_code_line);
++      session->wants_mediaremote = false;
++      return AIRPLAY_SEQ_ABORT;
++    }
++
++  DPRINTF(E_INFO, L_AIRPLAY, "MediaRemote: '%s' accepted (%d)\n", session->devname, req->response_code);
++  return AIRPLAY_SEQ_CONTINUE;
++}
++
++static void
++mediaremote_failure(struct airplay_session *session)
++{
++  DPRINTF(E_WARN, L_AIRPLAY, "MediaRemote request to '%s' failed\n", session->devname);
++}
++
++static void
++mediaremote_send(struct airplay_session *session, enum airplay_seq_type seq_type, const char *log_caller)
++{
++  if (session->wants_mediaremote)
++    sequence_start(seq_type, session, NULL, log_caller);
++}
++
++
+ static void
+ airplay_metadata_free(struct airplay_metadata *rmd)
+ {
+@@ -1660,6 +2084,9 @@ airplay_metadata_free(struct airplay_metadata *rmd)
+   if (rmd->artwork)
+     evbuffer_free(rmd->artwork);
+ 
++  free(rmd->title);
++  free(rmd->artist);
++  free(rmd->album);
+   free(rmd);
+ }
+ 
+@@ -1705,6 +2132,12 @@ airplay_metadata_prepare(struct output_metadata *metadata)
+ 
+   rmd->artwork_fmt = ret;
+ 
++  rmd->title = safe_strdup(queue_item->title);
++  rmd->artist = safe_strdup(queue_item->artist);
++  rmd->album = safe_strdup(queue_item->album);
++  rmd->len_ms = queue_item->song_length;
++  rmd->uid = mediaremote_uid(queue_item);
++
+   ret = dmap_encode_queue_metadata(rmd->metadata, tmp, queue_item);
+   evbuffer_free(tmp);
+   free_queue_item(queue_item, 0);
+@@ -1732,6 +2165,10 @@ airplay_metadata_send_generic(struct airplay_session *session, struct output_met
+   if (!only_progress && (session->wanted_metadata & AIRPLAY_MD_WANTS_ARTWORK) && rmd->artwork)
+     sequence_start(AIRPLAY_SEQ_SEND_ARTWORK, session, metadata, "SET_PARAMETER (artwork)");
+ 
++  // On startup the registration sequence already includes now playing
++  if (!metadata->startup)
++    mediaremote_send(session, AIRPLAY_SEQ_MRP_NOWPLAYING, "MediaRemote now playing");
++
+   return 0;
+ }
+ 
+@@ -1759,6 +2196,14 @@ airplay_metadata_send(struct output_metadata *metadata)
+   struct airplay_session *next;
+   int ret;
+ 
++  // Now playing is about the item being heard, metadata always comes in
++  // while playing
++  mrp_clock_set(metadata->pos_ms, true);
++
++  // Replace current metadata first, MediaRemote payloads are made from it
++  airplay_metadata_purge();
++  airplay_cur_metadata = metadata;
++
+   for (session = airplay_sessions; session; session = next)
+     {
+       next = session->next;
+@@ -1773,10 +2218,6 @@ airplay_metadata_send(struct output_metadata *metadata)
+ 	  continue;
+ 	}
+     }
+-
+-  // Replace current metadata with the new stuff
+-  airplay_metadata_purge();
+-  airplay_cur_metadata = metadata;
+ }
+ 
+ 
+@@ -2185,6 +2626,10 @@ packets_sync_send(struct airplay_master_session *ams)
+ 	  sync_pkt = rtp_sync_packet_next(ams->rtp_session, cur_stamp, 0x90);
+ 	  control_packet_send(session, sync_pkt);
+ 
++	  // Audio (re)starts on this device
++	  mrp_clock_resume();
++	  mediaremote_send(session, AIRPLAY_SEQ_MRP_NOWPLAYING, "MediaRemote playing");
++
+ 	  DPRINTF(E_DBG, L_AIRPLAY, "Start sync packet sent to '%s': offset=%d, cur_pos=%" PRIu32 ", cur_ts=%ld.%09ld, clock=%ld.%09ld, rtptime=%" PRIu32 ", timing=%s\n",
+ 	    session->devname, session->offset_samples, cur_stamp.pos, (long)cur_stamp.ts.tv_sec, (long)cur_stamp.ts.tv_nsec, (long)ts.tv_sec, (long)ts.tv_nsec,
+ 	    ams->rtp_session->pos, ams->use_ptp ? "PTP" : "NTP");
+@@ -3112,6 +3557,9 @@ response_handler_volume_start(struct evrtsp_request *req, struct airplay_session
+ {
+   int ret;
+ 
++  // Registration must come before other MediaRemote requests
++  mediaremote_send(session, AIRPLAY_SEQ_MRP_REGISTER, "MediaRemote register");
++
+   ret = airplay_metadata_startup_send(session);
+   if (ret < 0)
+     return AIRPLAY_SEQ_ABORT;
+@@ -3633,6 +4081,9 @@ static struct airplay_seq_definition airplay_seq_definition[] =
+   { AIRPLAY_SEQ_PAIR_VERIFY, session_pair_success, session_failure },
+   { AIRPLAY_SEQ_PAIR_TRANSIENT, session_pair_success, session_failure },
+   { AIRPLAY_SEQ_FEEDBACK, NULL, session_failure },
++  { AIRPLAY_SEQ_MRP_REGISTER, NULL, mediaremote_failure },
++  { AIRPLAY_SEQ_MRP_NOWPLAYING, NULL, mediaremote_failure },
++  { AIRPLAY_SEQ_MRP_STATE, NULL, mediaremote_failure },
+ };
+ 
+ // The size of the second array dimension MUST at least be the size of largest
+@@ -3700,6 +4151,22 @@ static struct airplay_seq_request airplay_seq_request[][7] =
+   {
+     { AIRPLAY_SEQ_FEEDBACK, "POST /feedback", EVRTSP_REQ_POST, NULL, NULL, NULL, "/feedback", true },
+   },
++  {
++    // Registration as a now playing source, then the current state. A real
++    // iPhone sends exactly this sequence (see the MediaRemote section).
++    { AIRPLAY_SEQ_MRP_REGISTER, "MediaRemote device info", EVRTSP_REQ_POST, payload_make_mrp_device_info, response_handler_mrp, "application/x-apple-binary-plist", "/command", true },
++    { AIRPLAY_SEQ_MRP_REGISTER, "MediaRemote now playing", EVRTSP_REQ_POST, payload_make_mrp_now_playing, response_handler_mrp, "application/x-apple-binary-plist", "/command", true },
++    { AIRPLAY_SEQ_MRP_REGISTER, "MediaRemote supported commands", EVRTSP_REQ_POST, payload_make_mrp_supported_commands, response_handler_mrp, "application/x-apple-binary-plist", "/command", true },
++    { AIRPLAY_SEQ_MRP_REGISTER, "MediaRemote playback state", EVRTSP_REQ_POST, payload_make_mrp_playback_state, response_handler_mrp, "application/x-apple-binary-plist", "/command", true },
++    { AIRPLAY_SEQ_MRP_REGISTER, "MediaRemote now playing client", EVRTSP_REQ_POST, payload_make_mrp_now_playing_client, response_handler_mrp, "application/x-apple-binary-plist", "/command", true },
++  },
++  {
++    { AIRPLAY_SEQ_MRP_NOWPLAYING, "MediaRemote now playing", EVRTSP_REQ_POST, payload_make_mrp_now_playing, response_handler_mrp, "application/x-apple-binary-plist", "/command", true },
++    { AIRPLAY_SEQ_MRP_NOWPLAYING, "MediaRemote playback state", EVRTSP_REQ_POST, payload_make_mrp_playback_state, response_handler_mrp, "application/x-apple-binary-plist", "/command", true },
++  },
++  {
++    { AIRPLAY_SEQ_MRP_STATE, "MediaRemote playback state", EVRTSP_REQ_POST, payload_make_mrp_playback_state, response_handler_mrp, "application/x-apple-binary-plist", "/command", true },
++  },
+ };
+ 
+ 
+@@ -4061,6 +4528,10 @@ airplay_device_cb(const char *name, const char *type, const char *domain, const
+     extra->wanted_metadata |= AIRPLAY_MD_WANTS_PROGRESS;
+   if (keyval_get(&features_kv, "MetadataFeatures_2"))
+     extra->wanted_metadata |= AIRPLAY_MD_WANTS_TEXT;
++  // Apple receivers (HomePod, Apple TV) only show now playing, and accept
++  // remote control, through MediaRemote
++  if (keyval_get(&features_kv, "MetadataFeatures_3"))
++    extra->wants_mediaremote = true;
+   if (keyval_get(&features_kv, "Authentication_8"))
+     extra->supports_auth_setup = 1;
+   if (keyval_get(&features_kv, "SupportsPTP") && !(devcfg && cfg_getbool(devcfg, "ptp_disable")) && !airplay_ptp_is_disabled)
+@@ -4193,6 +4664,11 @@ airplay_device_flush(struct output_device *device, int callback_id)
+ 
+   session->callback_id = callback_id;
+ 
++  // Flushing means pause, seek or track change: show paused until audio
++  // resumes, so the receiver doesn't extrapolate meanwhile
++  mrp_clock_pause();
++  mediaremote_send(session, AIRPLAY_SEQ_MRP_STATE, "MediaRemote paused");
++
+   sequence_start(AIRPLAY_SEQ_FLUSH, session, NULL, "flush");
+ 
+   return 1;
+diff --git a/src/outputs/airplay_events.c b/src/outputs/airplay_events.c
+index d0519ae..9c34acc 100644
+--- a/src/outputs/airplay_events.c
++++ b/src/outputs/airplay_events.c
+@@ -38,6 +38,7 @@
+ #include "misc.h"
+ #include "logger.h"
+ #include "player.h"
++#include "input.h"
+ #include "pair_ap/pair.h"
+ 
+ #define RTSP_VERSION "RTSP/1.0"
+@@ -47,6 +48,7 @@ enum airplay_events
+   AIRPLAY_EVENT_UNKNOWN,
+   AIRPLAY_EVENT_PLAY,
+   AIRPLAY_EVENT_PAUSE,
++  AIRPLAY_EVENT_PLAYPAUSE,
+   AIRPLAY_EVENT_NEXT,
+   AIRPLAY_EVENT_PREV,
+ };
+@@ -289,6 +291,25 @@ rtsp_parse(enum airplay_events *event, uint8_t *in, size_t in_len)
+       plist_get_string_val(item, &value);
+     }
+ 
++  // Newer receivers may only send the MRMediaRemoteCommand number
++  item = plist_dict_get_item(request, "modernMediaRemoteCommand");
++  if (!value && item)
++    {
++      static const char *legacy[] = { "play", "paus", "plps", "stop", "nitm", "pitm" };
++      uint64_t command = UINT64_MAX;
++      char *s = NULL;
++
++      if (plist_get_node_type(item) == PLIST_UINT)
++	plist_get_uint_val(item, &command);
++      else if (plist_get_node_type(item) == PLIST_STRING && (plist_get_string_val(item, &s), s))
++	{
++	  command = strtoull(s, NULL, 10);
++	  free(s);
++	}
++      if (command < ARRAY_SIZE(legacy))
++	value = strdup(legacy[command]);
++    }
++
+   if (!type || !value)
+     {
+       DPRINTF(E_DBG, L_AIRPLAY, "AirPlay event has no type/value: type=%s, value=%s\n", type, value);
+@@ -306,6 +327,8 @@ rtsp_parse(enum airplay_events *event, uint8_t *in, size_t in_len)
+     *event = AIRPLAY_EVENT_PAUSE;
+   else if (strcmp(value, "play") == 0)
+     *event = AIRPLAY_EVENT_PLAY;
++  else if (strcmp(value, "plps") == 0 || strcmp(value, "stop") == 0)
++    *event = AIRPLAY_EVENT_PLAYPAUSE;
+   else if (strcmp(value, "nitm") == 0)
+     *event = AIRPLAY_EVENT_NEXT;
+   else if (strcmp(value, "pitm") == 0)
+@@ -332,6 +355,30 @@ static void
+ handle_event(enum airplay_events event)
+ {
+   struct player_status status;
++  const char *forward = NULL;
++
++  switch (event)
++    {
++      case AIRPLAY_EVENT_PLAY:
++	forward = "play";
++	break;
++      case AIRPLAY_EVENT_PAUSE:
++	forward = "pause";
++	break;
++      case AIRPLAY_EVENT_PLAYPAUSE:
++	forward = "playpause";
++	break;
++      case AIRPLAY_EVENT_NEXT:
++	forward = "next";
++	break;
++      case AIRPLAY_EVENT_PREV:
++	forward = "prev";
++	break;
++      default:
++	break;
++    }
++  if (forward && input_live_remote_forward(forward))
++    return;
+ 
+   player_get_status(&status);
+ 
+@@ -339,6 +386,7 @@ handle_event(enum airplay_events event)
+     {
+       case AIRPLAY_EVENT_PLAY:
+       case AIRPLAY_EVENT_PAUSE:
++      case AIRPLAY_EVENT_PLAYPAUSE:
+ 	if (status.status == PLAY_PLAYING)
+ 	  player_playback_pause();
+ 	else
+diff --git a/src/player.c b/src/player.c
+index f9ce616..7a4c91f 100644
+--- a/src/player.c
++++ b/src/player.c
+@@ -2024,6 +2024,8 @@ playback_start_bh(void *arg, int *retval)
+ {
+   int ret;
+ 
++  input_live_trim();
++
+   ret = pb_timer_start();
+   if (ret < 0)
+     goto error;
