@@ -1,3 +1,5 @@
 *.o
 /pw-airplayd
 __pycache__/
+/result
+/result-*
