@@ -18,14 +18,18 @@ way from the desktop's sound settings.
   MPRIS: HomePods report title and play state, e.g. to Siri and in the Home
   app. Pausing the application pauses the AirPlay session.
 
-Tested on Fedora 44 (aarch64, PipeWire 1.6) with a HomePod mini on firmware
-27, and in daily use on NixOS (aarch64, PipeWire 1.6) for several weeks with
-a HomePod stereo pair, with stable latency, volume control and now-playing.
+## Tested devices
 
-Also reported working, unmodified: Fedora 44 with KDE Plasma and a pair of
-original HomePods, Asahi Linux on a MacBook Pro M1, and Ubuntu with HomePods
-on firmware 27. It should work with other AirPlay 2 receivers and
-distributions, which have not been tested.
+| Speaker | System |
+|---|---|
+| HomePod mini, firmware 27 | Fedora 44, aarch64 |
+| HomePod stereo pair | NixOS, aarch64 |
+| HomePod (1st gen) pair | Fedora 44, KDE Plasma |
+| HomePod (1st gen) | Debian 13 |
+| HomePod, firmware 27 | Ubuntu |
+| AirPlay 2 speaker | Asahi Linux, MacBook Pro M1 |
+
+Should work with other AirPlay 2 receivers and distributions.
 
 ## How it works
 
@@ -65,9 +69,7 @@ systemctl --user start pw-airplay
 
 `install.sh` checks the build dependencies first and prints the command to
 install the missing ones on Fedora. On other distributions, the same
-libraries are needed: the list of pkg-config names is in `install.sh`. The
-engine is built in `~/.cache/pw-airplay` and installed to
-`~/.local/opt/owntone`; running `install.sh` again updates everything.
+libraries are needed: the list of pkg-config names is in `install.sh`.
 
 On Debian 13, OwnTone's own (unpatched) code can fail to build: its
 `plist_new_unix_date()` call needs a newer libplist than Debian 13 ships.
@@ -80,55 +82,28 @@ with the wrong latency.
 
 ### NixOS
 
-This repository is also a flake, with a NixOS module (system-wide: `airptpd`
-+ firewall ports, equivalent to `install-system.sh`) and a Home Manager
-module (per-user: daemon, engine, configuration file, PipeWire drop-in,
-equivalent to `install.sh`). It needs Avahi, which NixOS does not enable by
-default:
-
 ```nix
 # configuration.nix
-services.avahi.enable = true;
-```
-
-In `configuration.nix`:
-
-```nix
 { config, lib, pkgs, ... }:
 let
   pw-airplay = builtins.getFlake "github:superlemon57/pw-airplay";
 in {
   imports = [ pw-airplay.nixosModules.default ];
+  services.avahi.enable = true;
   services.pw-airplay.enable = true;
 }
 ```
 
-In `home.nix`:
-
 ```nix
+# home.nix
 { config, lib, pkgs, ... }:
 let
   pw-airplay = builtins.getFlake "github:superlemon57/pw-airplay";
 in {
   imports = [ pw-airplay.homeModules.default ];
   services.pw-airplay.enable = true;
-
-  # Optional, mirrors pw-airplay.conf; see nix/module-home.nix for every
-  # option.
-  # services.pw-airplay.groups = {
-  #   Downstairs = [ "Living room" "Kitchen" ];
-  # };
 }
 ```
-
-Then `sudo nixos-rebuild switch` (this also activates Home Manager, if it is
-imported as a NixOS module; otherwise run `home-manager switch` too). The
-configuration file, the PipeWire drop-in and the systemd user units are
-generated from `services.pw-airplay.settings`/`.groups`; edit those in
-`home.nix` instead of the generated file.
-
-Pin to a commit instead of a branch for reproducibility:
-`builtins.getFlake "github:superlemon57/pw-airplay/<rev>"`.
 
 ## Configuration
 
@@ -144,13 +119,18 @@ After a change: `systemctl --user restart pw-airplay-engine pw-airplay`.
 
 ## Latency
 
-The reported latency is `start_buffer_ms + pipe_start_buffer_ms` plus about
-35 ms of buffering in pw-airplayd, 2402 ms with the defaults, which is close
-to what Apple devices use. `pw-airplayd --print-latency` prints it. If picture
-and sound are slightly off, adjust `latency_offset_ms`.
+AirPlay 2 latency (about 2.4 s) is part of the protocol, not a bug: Apple's
+own senders use the same order of magnitude, for the buffering multi-room
+sync needs. pw-airplay does not lower it; it reports the real value to
+PipeWire so picture and sound stay in sync, instead of hiding it.
 
-Sounds that are not tied to a picture (notifications, games) are heard about
-2.4 s late, as with any AirPlay sender.
+- Reported latency is `start_buffer_ms + pipe_start_buffer_ms` plus about
+  35 ms of buffering in pw-airplayd, 2402 ms with the defaults.
+  `pw-airplayd --print-latency` prints it.
+- `latency_offset_ms` corrects sound arriving early or late relative to the
+  picture; it does not reduce the end-to-end delay.
+- Sound not tied to a picture (notifications, games) is heard about 2.4 s
+  late, as with any AirPlay sender.
 
 ## Known limitations
 
