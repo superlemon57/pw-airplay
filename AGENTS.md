@@ -30,6 +30,7 @@ An AirPlay 2 output for PipeWire. Two programs cooperate:
 | `install.sh`, `install-system.sh`, `uninstall.sh` | installation |
 | `tests/run.py` | end to end tests against `mock_engine.py` and `mock_player.py`, under sanitizers |
 | `tests/check_exposure.sh` | network and file exposure checks of a running installation |
+| `flake.nix`, `nix/` | NixOS/Home Manager packaging; `nix/owntone-airplay.nix` and `nix/pw-airplayd.nix` mirror `install.sh`, `nix/module-nixos.nix` mirrors `install-system.sh`, `nix/module-home.nix` is the per-user Home Manager module |
 
 ## Building
 

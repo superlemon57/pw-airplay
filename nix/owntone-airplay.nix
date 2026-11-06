@@ -29,10 +29,8 @@
 , systemd
 }:
 
-# OwnTone, built from source with pw-airplay's patch (live pipe start,
-# remote commands over a fifo, MediaRemote now-playing, locked-down network
-# exposure) and with its PTP clock daemon, airptpd, enabled. Mirrors the
-# steps in ../install.sh's build_engine().
+# OwnTone, patched (../engine/owntone-29.3.patch) and with its PTP clock
+# daemon, airptpd, enabled. Mirrors install.sh's build_engine().
 stdenv.mkDerivation (finalAttrs: {
   pname = "owntone-airplay";
   version = "29.3";
@@ -84,10 +82,9 @@ stdenv.mkDerivation (finalAttrs: {
     "--disable-mpd"
   ];
 
-  # airptpd lives in the same tree as a nested autotools package
-  # (src/libairptp, pulled in via AC_CONFIG_SUBDIRS) and is off by default.
-  # Reconfigure it with --enable-daemon after the top-level configure, same
-  # prefix, so the recursive `make`/`make install` below picks it up too.
+  # airptpd (src/libairptp, a nested autotools package) is off by default;
+  # reconfigure it with --enable-daemon so the recursive make/make install
+  # below builds and installs it too.
   postConfigure = ''
     (cd src/libairptp && ./configure --prefix=$prefix --enable-daemon)
   '';

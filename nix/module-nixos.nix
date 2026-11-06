@@ -7,19 +7,15 @@ let
 in {
   options.services.pw-airplay = {
     enable = lib.mkEnableOption ''
-      airptpd, the PTP clock daemon AirPlay 2 speakers synchronise to for
-      multi-room sync. This is the system-wide half of pw-airplay
-      (equivalent of install-system.sh); the per-user daemon, engine and
-      configuration are provided by pw-airplay's Home Manager module
+      airptpd, the PTP clock AirPlay 2 speakers synchronise to for
+      multi-room sync. System-wide half of pw-airplay; the per-user
+      daemon, engine and configuration are in the Home Manager module
     '';
 
     openFirewall = lib.mkOption {
       type = lib.types.bool;
       default = true;
-      description = ''
-        Open UDP ports 319 and 320 (PTP) so AirPlay 2 speakers can reach
-        airptpd.
-      '';
+      description = "Open UDP ports 319 and 320 (PTP) so speakers can reach airptpd.";
     };
   };
 
