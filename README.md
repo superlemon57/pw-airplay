@@ -69,6 +69,11 @@ libraries are needed: the list of pkg-config names is in `install.sh`. The
 engine is built in `~/.cache/pw-airplay` and installed to
 `~/.local/opt/owntone`; running `install.sh` again updates everything.
 
+On Debian 13, OwnTone's own (unpatched) code can fail to build: its
+`plist_new_unix_date()` call needs a newer libplist than Debian 13 ships.
+Reported fix: call `plist_new_date()` instead, which takes an Apple-epoch
+(2001-01-01) timestamp rather than a Unix one.
+
 PipeWire's own AirPlay 1 sinks (`module-raop-discover`) are disabled by a
 configuration drop-in, since they would show the same speakers a second time
 with the wrong latency.
@@ -160,10 +165,6 @@ Sounds that are not tied to a picture (notifications, games) are heard about
 - Speakers must be on the same network segment. VPN clients that block local
   network traffic (for instance Mullvad with "Local network sharing" off)
   prevent any connection.
-- Reported on Debian 13: the OwnTone build can fail because its libplist is
-  too old to provide `plist_new_unix_date()`. Not fixed in the patch yet;
-  the fallback is to call `plist_new_date()` instead, which takes an
-  Apple-epoch (2001-01-01) timestamp rather than a Unix one.
 
 ## Security
 
