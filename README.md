@@ -23,7 +23,7 @@ way from the desktop's sound settings.
 | Speaker | System |
 |---|---|
 | HomePod mini, firmware 27 | Fedora 44, aarch64 |
-| HomePod stereo pair | NixOS, aarch64 |
+| HomePod mini stereo pair | NixOS, aarch64 |
 | HomePod (1st gen) pair | Fedora 44, KDE Plasma |
 | HomePod (1st gen) | Debian 13 |
 | HomePod, firmware 27 | Ubuntu |
