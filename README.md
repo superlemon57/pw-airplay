@@ -18,8 +18,14 @@ way from the desktop's sound settings.
   MPRIS: HomePods report title and play state, e.g. to Siri and in the Home
   app. Pausing the application pauses the AirPlay session.
 
-Tested on Fedora 44 (aarch64, PipeWire 1.6) with HomePod mini on firmware 27.
-It should work with other AirPlay 2 receivers, which have not been tested.
+Tested on Fedora 44 (aarch64, PipeWire 1.6) with a HomePod mini on firmware
+27, and in daily use on NixOS (aarch64, PipeWire 1.6) for several weeks with
+a HomePod stereo pair, with stable latency, volume control and now-playing.
+
+Also reported working, unmodified: Fedora 44 with KDE Plasma and a pair of
+original HomePods, Asahi Linux on a MacBook Pro M1, and Ubuntu with HomePods
+on firmware 27. It should work with other AirPlay 2 receivers and
+distributions, which have not been tested.
 
 ## How it works
 
@@ -154,6 +160,10 @@ Sounds that are not tied to a picture (notifications, games) are heard about
 - Speakers must be on the same network segment. VPN clients that block local
   network traffic (for instance Mullvad with "Local network sharing" off)
   prevent any connection.
+- Reported on Debian 13: the OwnTone build can fail because its libplist is
+  too old to provide `plist_new_unix_date()`. Not fixed in the patch yet;
+  the fallback is to call `plist_new_date()` instead, which takes an
+  Apple-epoch (2001-01-01) timestamp rather than a Unix one.
 
 ## Security
 
