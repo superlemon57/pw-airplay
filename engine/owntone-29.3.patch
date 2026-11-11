@@ -21,6 +21,11 @@ a named pipe. These changes adapt it to that use:
   http_bind_address): no advertising as an iTunes/DAAP library, only the DACP
   service the speakers need. DACP requests from a speaker we stream to are
   authorized by its Active-Remote id rather than by network trust.
+- Discrete stereo channel routing (outputs/airplay.c): when streaming to
+  speakers designated Left or Right (such as a HomePod stereo pair), each
+  speaker receives its own discrete channel duplicated to both ALAC channels,
+  so the speaker's internal DSP downmix produces true isolated Left or
+  Right channel playback rather than a combined mono mix.
 - Build (configure.ac): the librespot-c subproject is not configured, so
   building without Spotify support does not require protobuf-c.
 
@@ -463,10 +468,18 @@ index 4347230..175d10e 100644
  struct evhttp;
  
 diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
-index 9ba7410..a54a90d 100644
+index 9ba7410..3fd5818 100644
 --- a/src/outputs/airplay.c
 +++ b/src/outputs/airplay.c
-@@ -172,6 +172,9 @@ enum airplay_seq_type
+@@ -92,6 +92,7 @@
+ // parameter returned by an AE. Sigh, it would be nice to have a published
+ // protocol...
+ #define AIRPLAY_AUDIO_LATENCY_MS                250
++#define RTP_HEADER_LEN                          12
+ 
+ // For transient pairing the key_len will be 64 bytes, but only 32 are used for
+ // audio payload encryption. For normal pairing the key is 32 bytes.
+@@ -172,6 +173,9 @@ enum airplay_seq_type
    AIRPLAY_SEQ_PAIR_VERIFY,
    AIRPLAY_SEQ_PAIR_TRANSIENT,
    AIRPLAY_SEQ_FEEDBACK,
@@ -476,7 +489,7 @@ index 9ba7410..a54a90d 100644
    AIRPLAY_SEQ_CONTINUE, // Must be last element
  };
  
-@@ -203,6 +206,7 @@ struct airplay_extra
+@@ -203,6 +207,7 @@ struct airplay_extra
    char *mdns_name;
  
    uint16_t wanted_metadata;
@@ -484,7 +497,7 @@ index 9ba7410..a54a90d 100644
    bool supports_auth_setup;
    bool supports_encryption;
    bool use_ptp;
-@@ -252,6 +256,7 @@ struct airplay_session
+@@ -252,6 +257,7 @@ struct airplay_session
  
    uint64_t statusflags;
    uint16_t wanted_metadata;
@@ -492,7 +505,18 @@ index 9ba7410..a54a90d 100644
    bool req_has_auth;
    bool supports_auth_setup;
    bool supports_encryption;
-@@ -317,6 +322,13 @@ struct airplay_metadata
+@@ -309,6 +315,10 @@ struct airplay_session
+ 
+   uint32_t ptpd_slave_id;
+ 
++  struct encode_ctx *encode_ctx;
++  struct evbuffer *encoded_buffer;
++  int channel_mode; /* 0 = stereo, 1 = left, 2 = right */
++
+   struct airplay_session *next;
+ };
+ 
+@@ -317,6 +327,13 @@ struct airplay_metadata
    struct evbuffer *metadata;
    struct evbuffer *artwork;
    int artwork_fmt;
@@ -506,7 +530,19 @@ index 9ba7410..a54a90d 100644
  };
  
  struct airplay_service
-@@ -1610,6 +1622,7 @@ session_make(struct output_device *device, int callback_id)
+@@ -1257,6 +1274,11 @@ session_free(struct airplay_session *session)
+   free(session->address);
+   free(session->devname);
+ 
++  if (session->encode_ctx)
++    transcode_encode_cleanup(&session->encode_ctx);
++  if (session->encoded_buffer)
++    evbuffer_free(session->encoded_buffer);
++
+   free(session);
+ }
+ 
+@@ -1610,6 +1632,7 @@ session_make(struct output_device *device, int callback_id)
  
    session->supports_auth_setup = extra->supports_auth_setup;
    session->wanted_metadata = extra->wanted_metadata;
@@ -514,7 +550,35 @@ index 9ba7410..a54a90d 100644
    session->supports_encryption = extra->supports_encryption;
  
    session->next_seq = AIRPLAY_SEQ_CONTINUE;
-@@ -1649,6 +1662,417 @@ session_make(struct output_device *device, int callback_id)
+@@ -1631,6 +1654,27 @@ session_make(struct output_device *device, int callback_id)
+       goto error;
+     }
+ 
++  if (strcasestr(device->name, "left"))
++    session->channel_mode = 1;
++  else if (strcasestr(device->name, "right"))
++    session->channel_mode = 2;
++  else
++    session->channel_mode = 0;
++
++  if (session->channel_mode != 0)
++    {
++      struct transcode_encode_setup_args encode_args = { .profile = XCODE_ALAC, .quality = &device->quality };
++      encode_args.src_ctx = transcode_decode_setup_raw(XCODE_PCM16, &device->quality);
++      if (encode_args.src_ctx)
++        {
++          session->encode_ctx = transcode_encode_setup(encode_args);
++          transcode_decode_cleanup(&encode_args.src_ctx);
++        }
++      session->encoded_buffer = evbuffer_new();
++      DPRINTF(E_LOG, L_AIRPLAY, "AirPlay: Device '%s' configured for discrete %s channel\n",
++        device->name, session->channel_mode == 1 ? "LEFT" : "RIGHT");
++    }
++
+   // Attach to list of sessions
+   session->next = airplay_sessions;
+   airplay_sessions = session;
+@@ -1649,6 +1693,417 @@ session_make(struct output_device *device, int callback_id)
  
  /* ----------------------------- Metadata handling -------------------------- */
  
@@ -932,7 +996,7 @@ index 9ba7410..a54a90d 100644
  static void
  airplay_metadata_free(struct airplay_metadata *rmd)
  {
-@@ -1660,6 +2084,9 @@ airplay_metadata_free(struct airplay_metadata *rmd)
+@@ -1660,6 +2115,9 @@ airplay_metadata_free(struct airplay_metadata *rmd)
    if (rmd->artwork)
      evbuffer_free(rmd->artwork);
  
@@ -942,7 +1006,7 @@ index 9ba7410..a54a90d 100644
    free(rmd);
  }
  
-@@ -1705,6 +2132,12 @@ airplay_metadata_prepare(struct output_metadata *metadata)
+@@ -1705,6 +2163,12 @@ airplay_metadata_prepare(struct output_metadata *metadata)
  
    rmd->artwork_fmt = ret;
  
@@ -955,7 +1019,7 @@ index 9ba7410..a54a90d 100644
    ret = dmap_encode_queue_metadata(rmd->metadata, tmp, queue_item);
    evbuffer_free(tmp);
    free_queue_item(queue_item, 0);
-@@ -1732,6 +2165,10 @@ airplay_metadata_send_generic(struct airplay_session *session, struct output_met
+@@ -1732,6 +2196,10 @@ airplay_metadata_send_generic(struct airplay_session *session, struct output_met
    if (!only_progress && (session->wanted_metadata & AIRPLAY_MD_WANTS_ARTWORK) && rmd->artwork)
      sequence_start(AIRPLAY_SEQ_SEND_ARTWORK, session, metadata, "SET_PARAMETER (artwork)");
  
@@ -966,7 +1030,7 @@ index 9ba7410..a54a90d 100644
    return 0;
  }
  
-@@ -1759,6 +2196,14 @@ airplay_metadata_send(struct output_metadata *metadata)
+@@ -1759,6 +2227,14 @@ airplay_metadata_send(struct output_metadata *metadata)
    struct airplay_session *next;
    int ret;
  
@@ -981,7 +1045,7 @@ index 9ba7410..a54a90d 100644
    for (session = airplay_sessions; session; session = next)
      {
        next = session->next;
-@@ -1773,10 +2218,6 @@ airplay_metadata_send(struct output_metadata *metadata)
+@@ -1773,10 +2249,6 @@ airplay_metadata_send(struct output_metadata *metadata)
  	  continue;
  	}
      }
@@ -992,7 +1056,71 @@ index 9ba7410..a54a90d 100644
  }
  
  
-@@ -2185,6 +2626,10 @@ packets_sync_send(struct airplay_master_session *ams)
+@@ -2097,16 +2569,59 @@ packets_send(struct airplay_master_session *ams)
+       if (session->master_session != ams)
+ 	continue;
+ 
++      struct rtp_packet sess_pkt = *pkt;
++      uint8_t custom_data[RTP_HEADER_LEN + 4096];
++
++      if (session->channel_mode != 0 && session->encode_ctx && session->encoded_buffer &&
++          ams->quality.channels == 2 && ams->quality.bits_per_sample == 16)
++        {
++          const int16_t *src = (const int16_t *)ams->rawbuf;
++          int nsamples = ams->samples_per_packet;
++          int16_t chan_buf[AIRPLAY_SAMPLES_PER_PACKET * 2];
++
++          if (nsamples <= AIRPLAY_SAMPLES_PER_PACKET)
++            {
++              if (session->channel_mode == 1) // Left
++                {
++                  for (int i = 0; i < nsamples; i++)
++                    {
++                      chan_buf[2 * i] = src[2 * i];
++                      chan_buf[2 * i + 1] = src[2 * i];
++                    }
++                }
++              else if (session->channel_mode == 2) // Right
++                {
++                  for (int i = 0; i < nsamples; i++)
++                    {
++                      chan_buf[2 * i] = src[2 * i + 1];
++                      chan_buf[2 * i + 1] = src[2 * i + 1];
++                    }
++                }
++
++              int clen = alac_encode(session->encoded_buffer, session->encode_ctx, (uint8_t *)chan_buf, ams->rawbuf_size, nsamples, &ams->quality);
++              if (clen > 0 && clen <= 4096)
++                {
++                  memcpy(custom_data, pkt->header, RTP_HEADER_LEN);
++                  evbuffer_remove(session->encoded_buffer, custom_data + RTP_HEADER_LEN, clen);
++                  sess_pkt.data = custom_data;
++                  sess_pkt.header = custom_data;
++                  sess_pkt.payload = custom_data + RTP_HEADER_LEN;
++                  sess_pkt.payload_len = clen;
++                  sess_pkt.data_len = RTP_HEADER_LEN + clen;
++                }
++            }
++        }
++
+       // Device just joined
+       if (session->state == AIRPLAY_STATE_CONNECTED)
+ 	{
+-	  pkt->header[1] |= RTP_MARKER_BIT; // Set marker bit, value becomes 0xe0
+-	  packet_send(session, pkt);
+-	  pkt->header[1] &= ~RTP_MARKER_BIT; // Clear marker bit
++	  sess_pkt.header[1] |= RTP_MARKER_BIT; // Set marker bit, value becomes 0xe0
++	  packet_send(session, &sess_pkt);
++	  sess_pkt.header[1] &= ~RTP_MARKER_BIT; // Clear marker bit
+ 	}
+       else if (session->state == AIRPLAY_STATE_STREAMING)
+ 	{
+-	  packet_send(session, pkt);
++	  packet_send(session, &sess_pkt);
+ 	}
+     }
+ 
+@@ -2185,6 +2700,10 @@ packets_sync_send(struct airplay_master_session *ams)
  	  sync_pkt = rtp_sync_packet_next(ams->rtp_session, cur_stamp, 0x90);
  	  control_packet_send(session, sync_pkt);
  
@@ -1003,7 +1131,7 @@ index 9ba7410..a54a90d 100644
  	  DPRINTF(E_DBG, L_AIRPLAY, "Start sync packet sent to '%s': offset=%d, cur_pos=%" PRIu32 ", cur_ts=%ld.%09ld, clock=%ld.%09ld, rtptime=%" PRIu32 ", timing=%s\n",
  	    session->devname, session->offset_samples, cur_stamp.pos, (long)cur_stamp.ts.tv_sec, (long)cur_stamp.ts.tv_nsec, (long)ts.tv_sec, (long)ts.tv_nsec,
  	    ams->rtp_session->pos, ams->use_ptp ? "PTP" : "NTP");
-@@ -3112,6 +3557,9 @@ response_handler_volume_start(struct evrtsp_request *req, struct airplay_session
+@@ -3112,6 +3631,9 @@ response_handler_volume_start(struct evrtsp_request *req, struct airplay_session
  {
    int ret;
  
@@ -1013,7 +1141,7 @@ index 9ba7410..a54a90d 100644
    ret = airplay_metadata_startup_send(session);
    if (ret < 0)
      return AIRPLAY_SEQ_ABORT;
-@@ -3633,6 +4081,9 @@ static struct airplay_seq_definition airplay_seq_definition[] =
+@@ -3633,6 +4155,9 @@ static struct airplay_seq_definition airplay_seq_definition[] =
    { AIRPLAY_SEQ_PAIR_VERIFY, session_pair_success, session_failure },
    { AIRPLAY_SEQ_PAIR_TRANSIENT, session_pair_success, session_failure },
    { AIRPLAY_SEQ_FEEDBACK, NULL, session_failure },
@@ -1023,7 +1151,7 @@ index 9ba7410..a54a90d 100644
  };
  
  // The size of the second array dimension MUST at least be the size of largest
-@@ -3700,6 +4151,22 @@ static struct airplay_seq_request airplay_seq_request[][7] =
+@@ -3700,6 +4225,22 @@ static struct airplay_seq_request airplay_seq_request[][7] =
    {
      { AIRPLAY_SEQ_FEEDBACK, "POST /feedback", EVRTSP_REQ_POST, NULL, NULL, NULL, "/feedback", true },
    },
@@ -1046,7 +1174,7 @@ index 9ba7410..a54a90d 100644
  };
  
  
-@@ -4061,6 +4528,10 @@ airplay_device_cb(const char *name, const char *type, const char *domain, const
+@@ -4061,6 +4602,10 @@ airplay_device_cb(const char *name, const char *type, const char *domain, const
      extra->wanted_metadata |= AIRPLAY_MD_WANTS_PROGRESS;
    if (keyval_get(&features_kv, "MetadataFeatures_2"))
      extra->wanted_metadata |= AIRPLAY_MD_WANTS_TEXT;
@@ -1057,7 +1185,7 @@ index 9ba7410..a54a90d 100644
    if (keyval_get(&features_kv, "Authentication_8"))
      extra->supports_auth_setup = 1;
    if (keyval_get(&features_kv, "SupportsPTP") && !(devcfg && cfg_getbool(devcfg, "ptp_disable")) && !airplay_ptp_is_disabled)
-@@ -4193,6 +4664,11 @@ airplay_device_flush(struct output_device *device, int callback_id)
+@@ -4193,6 +4738,11 @@ airplay_device_flush(struct output_device *device, int callback_id)
  
    session->callback_id = callback_id;
  
